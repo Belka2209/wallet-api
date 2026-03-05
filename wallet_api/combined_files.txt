@@ -1,0 +1,1064 @@
+=== Файл: .pytest_cache\CACHEDIR.TAG ===
+Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by pytest.
+# For information about cache directory tags, see:
+#	https://bford.info/cachedir/spec.html
+
+=== Файл: .pytest_cache\README.md ===
+# pytest cache directory #
+
+This directory contains data from the pytest's cache plugin,
+which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+
+**Do not** commit this to version control.
+
+See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+
+=== Файл: .pytest_cache\v\cache\lastfailed ===
+{}
+
+=== Файл: .pytest_cache\v\cache\nodeids ===
+[
+  "tests/test_simple.py::test_simple",
+  "tests/test_wallets.py::test_concurrent_operations",
+  "tests/test_wallets.py::test_create_wallet",
+  "tests/test_wallets.py::test_deposit_operation",
+  "tests/test_wallets.py::test_get_nonexistent_wallet",
+  "tests/test_wallets.py::test_get_wallet_balance",
+  "tests/test_wallets.py::test_insufficient_funds",
+  "tests/test_wallets.py::test_invalid_amount",
+  "tests/test_wallets.py::test_withdraw_operation"
+]
+
+=== Файл: .pytest_cache\v\cache\stepwise ===
+[]
+
+=== Файл: Dockerfile ===
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Set Python path
+ENV PYTHONPATH=/app
+
+# Create alembic.ini if it doesn't exist
+RUN if [ ! -f alembic.ini ]; then \
+    echo "[alembic]" > alembic.ini && \
+    echo "script_location = migrations" >> alembic.ini && \
+    echo "prepend_sys_path = ." >> alembic.ini; \
+    fi
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+=== Файл: alembic.ini ===
+[alembic]
+script_location = migrations
+prepend_sys_path = .
+version_path_separator = os
+version_table_name = alembic_version
+
+[post_write_hooks]
+hooks = black
+black.type = console_scripts
+black.entrypoint = black
+black.options = -l 88
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+
+=== Файл: app\__init__.py ===
+
+
+=== Файл: app\api\__init__.py ===
+
+
+=== Файл: app\api\dependencies.py ===
+
+
+=== Файл: app\api\endpoints\__init__.py ===
+
+
+=== Файл: app\api\endpoints\wallets.py ===
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.core.database import get_db
+from app.schemas.wallet import (
+    WalletResponse,
+    OperationRequest,
+    OperationResponse,
+    ErrorResponse,
+)
+from app.services.wallet_service import WalletService
+from sqlalchemy import create_engine
+
+router = APIRouter(prefix="/api/v1/wallets", tags=["wallets"])
+# Можно настроить размер кэша
+engine = create_engine(
+    "postgresql+asyncpg://...",
+    query_cache_size=0,  # Отключить кэширование запросов
+)
+
+
+@router.get(
+    "/{wallet_uuid}",
+    response_model=WalletResponse,
+    responses={404: {"model": ErrorResponse, "description": "Wallet not found"}},
+)
+async def get_wallet_balance(wallet_uuid: UUID, db: AsyncSession = Depends(get_db)):
+    """
+    Get wallet balance by UUID
+    """
+    service = WalletService(db)
+    wallet = await service.get_wallet(wallet_uuid)
+
+    if not wallet:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Wallet not found"
+        )
+
+    return wallet
+
+
+@router.post(
+    "/{wallet_uuid}/operation",
+    response_model=OperationResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Bad request"},
+        404: {"model": ErrorResponse, "description": "Wallet not found"},
+        409: {"model": ErrorResponse, "description": "Concurrent modification"},
+    },
+)
+async def perform_operation(
+    wallet_uuid: UUID, operation: OperationRequest, db: AsyncSession = Depends(get_db)
+):
+    """
+    Perform deposit or withdraw operation on wallet
+    """
+    service = WalletService(db)
+
+    try:
+        updated_wallet = await service.update_balance(
+            wallet_uuid, operation.operation_type, operation.amount
+        )
+
+        if not updated_wallet:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Wallet not found"
+            )
+
+        return OperationResponse(
+            uuid=wallet_uuid,
+            balance=updated_wallet.balance,
+            operation_type=operation.operation_type,
+            amount=operation.amount,
+        )
+
+    except ValueError as e:
+        # Ошибка недостаточности средств
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except SQLAlchemyError as e:
+        # Ошибка базы данных (включая deadlock)
+        print(f"SQLAlchemyError: {e}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Operation failed due to database error",
+        )
+    except Exception as e:
+        # Другие неожиданные ошибки
+        print(f"Unexpected error: {e}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+
+@router.post("", response_model=WalletResponse, status_code=status.HTTP_201_CREATED)
+async def create_wallet(db: AsyncSession = Depends(get_db)):
+    """
+    Create a new wallet (utility endpoint)
+    """
+    service = WalletService(db)
+    wallet = await service.create_wallet()
+    return wallet
+
+=== Файл: app\core\__init__.py ===
+
+
+=== Файл: app\core\config.py ===
+from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
+
+
+class Settings(BaseSettings):
+    "Application settings loaded from environment variables or .env file"
+    # Database
+    DATABASE_URL: str = "postgresql+asyncpg://user:password@localhost:5432/wallet_db"
+
+    # App
+    APP_NAME: str = "Wallet API"
+    APP_VERSION: str = "1.0.0"
+    DEBUG: bool = False
+
+    model_config = ConfigDict(env_file=".env", case_sensitive=True)
+
+
+settings = Settings()
+
+=== Файл: app\core\database.py ===
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.orm import declarative_base
+from typing import AsyncGenerator
+from app.core.config import settings
+
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=True,
+    future=True
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False
+)
+
+Base = declarative_base()
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Dependency for getting async database session
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+
+=== Файл: app\main.py ===
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.config import settings
+from app.api.endpoints import wallets
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    debug=settings.DEBUG
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(wallets.router)
+
+
+@app.get("/")
+async def root():
+    "Root endpoint with basic info about the API"
+    return {
+        "message": "Welcome to Wallet API",
+        "version": settings.APP_VERSION,
+        "docs_url": "/docs"
+    }
+
+
+@app.get("/health")
+async def health_check():
+    "Health check endpoint to verify API is running"
+    return {"status": "healthy"}
+
+=== Файл: app\models\__init__.py ===
+
+
+=== Файл: app\models\wallet.py ===
+from uuid import uuid4
+from decimal import Decimal
+
+from sqlalchemy import Column, String, Numeric, DateTime
+from sqlalchemy.sql import func
+from app.core.database import Base
+
+
+class Wallet(Base):
+    """SQLAlchemy model for wallet"""
+    __tablename__ = "wallets"
+
+    uuid = Column(
+        String(36), primary_key=True, index=True, default=lambda: str(uuid4())
+    )
+    balance = Column(
+        Numeric(10, 2), nullable=False, default=0.00, server_default="0.00"
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    def __repr__(self):
+        "Return string representation of wallet"
+        return f"<Wallet(uuid={self.uuid}, balance={self.balance})>"
+
+    @property
+    def balance_decimal(self) -> Decimal:
+        "Return balance as Decimal with 2 decimal places"
+        return Decimal(str(self.balance))
+
+=== Файл: app\schemas\__init__.py ===
+
+
+=== Файл: app\schemas\wallet.py ===
+from decimal import Decimal
+from uuid import UUID
+from enum import Enum
+
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+
+
+class OperationType(str, Enum):
+    "Type of wallet operation"
+    DEPOSIT = "DEPOSIT"
+    WITHDRAW = "WITHDRAW"
+
+
+class WalletBase(BaseModel):
+    "Base schema for wallet responses"
+    uuid: UUID
+
+
+class WalletResponse(WalletBase):
+    "Schema for wallet responses"
+    balance: Decimal = Field(..., ge=0, decimal_places=2)
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OperationRequest(BaseModel):
+    "Schema for wallet operation requests"
+    operation_type: OperationType
+    amount: Decimal = Field(..., gt=0, decimal_places=2)
+
+    @field_validator("amount")
+    def validate_amount(cls, v):
+        "Validate that amount is greater than 0 and has at most 2 decimal places"
+        if v <= 0:
+            raise ValueError("Amount must be greater than 0")
+        if v.as_tuple().exponent < -2:
+            raise ValueError("Amount must have at most 2 decimal places")
+        return v
+
+
+class OperationResponse(BaseModel):
+    "Schema for wallet operation responses"
+    uuid: UUID
+    balance: Decimal
+    operation_type: OperationType
+    amount: Decimal
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ErrorResponse(BaseModel):
+    "Schema for error responses"
+    detail: str
+
+=== Файл: app\services\__init__.py ===
+
+
+=== Файл: app\services\wallet_service.py ===
+from decimal import Decimal
+from uuid import UUID
+from typing import Optional
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+from app.models.wallet import Wallet
+from app.schemas.wallet import OperationType
+
+
+class WalletService:
+    "Service class for wallet operations"
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def get_wallet(self, wallet_uuid: UUID) -> Optional[Wallet]:
+        """Get wallet by UUID"""
+        query = select(Wallet).where(Wallet.uuid == str(wallet_uuid))
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
+
+    async def get_wallet_balance(self, wallet_uuid: UUID) -> Optional[Decimal]:
+        """Get wallet balance by UUID"""
+        wallet = await self.get_wallet(wallet_uuid)
+        return wallet.balance if wallet else None
+
+    async def create_wallet(self) -> Wallet:
+        """Create a new wallet"""
+        wallet = Wallet()
+        self.db.add(wallet)
+        await self.db.commit()
+        await self.db.refresh(wallet)
+        return wallet
+
+    async def update_balance(
+        self, wallet_uuid: UUID, operation_type: OperationType, amount: Decimal
+    ) -> Optional[Wallet]:
+        """
+        Update wallet balance with proper locking to handle concurrency
+        """
+        # Начинаем транзакцию
+        async with self.db.begin():
+            # Получаем кошелек с блокировкой FOR UPDATE
+            query = (
+                select(Wallet).where(Wallet.uuid == str(wallet_uuid)).with_for_update()
+            )
+
+            result = await self.db.execute(query)
+            wallet = result.scalar_one_or_none()
+
+            if not wallet:
+                return None
+
+            # Проверяем достаточно ли средств для снятия
+            current_balance = Decimal(str(wallet.balance))
+
+            if operation_type == OperationType.WITHDRAW:
+                if current_balance < amount:
+                    raise ValueError("Insufficient funds")
+                new_balance = current_balance - amount
+            else:  # DEPOSIT
+                new_balance = current_balance + amount
+
+            # Обновляем баланс
+            wallet.balance = new_balance
+
+            # Сохраняем изменения
+            self.db.add(wallet)
+
+            # Коммит произойдет при выходе из контекстного менеджера
+
+        # Обновляем объект из БД
+        await self.db.refresh(wallet)
+        return wallet
+
+=== Файл: docker-compose.yml ===
+version: '3.12.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: wallet_db
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: wallet_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d wallet_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: wallet_api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://user:password@db:5432/wallet_db
+      PYTHONPATH: /app
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    restart: always
+    command: >
+      sh -c "sleep 5 &&
+             export PYTHONPATH=/app &&
+             cd /app &&
+             alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+volumes:
+  postgres_data:
+
+=== Файл: migrations\__init__.py ===
+
+
+=== Файл: migrations\env.py ===
+import asyncio
+import sys
+import os
+from logging.config import fileConfig
+
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
+
+from alembic import context
+
+# Добавляем путь к корневой директории проекта
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+from app.core.config import settings
+from app.core.database import Base
+
+
+# this is the Alembic Config object
+config = context.config
+
+# Interpret the config file for Python logging
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# Set target metadata
+target_metadata = Base.metadata
+
+# Set database URL
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode."""
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def do_run_migrations(connection: Connection) -> None:
+    """Run migrations with a given connection."""
+    context.configure(connection=connection, target_metadata=target_metadata)
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_async_migrations() -> None:
+    """Run migrations in 'online' mode with async support."""
+    connectable = async_engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
+
+    await connectable.dispose()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode."""
+    asyncio.run(run_async_migrations())
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+=== Файл: migrations\script.py.mako ===
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+
+"""
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
+
+# revision identifiers, used by Alembic.
+revision = ${repr(up_revision)}
+down_revision = ${repr(down_revision)}
+branch_labels = ${repr(branch_labels)}
+depends_on = ${repr(depends_on)}
+
+
+def upgrade() -> None:
+    ${upgrades if upgrades else "pass"}
+
+
+def downgrade() -> None:
+    ${downgrades if downgrades else "pass"}
+
+=== Файл: migrations\versions\__init__.py ===
+
+
+=== Файл: migrations\versions\initial_migration.py ===
+"""initial migration
+
+Revision ID: initial
+Revises: 
+Create Date: 2024-01-01 00:00:00.000000
+
+"""
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision = 'initial'
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        'wallets',
+        sa.Column('uuid', sa.String(36), nullable=False),
+        sa.Column('balance', sa.Numeric(10, 2), nullable=False, server_default='0.00'),
+        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime(timezone=True), onupdate=sa.text('now()')),
+        sa.PrimaryKeyConstraint('uuid')
+    )
+    op.create_index(op.f('ix_wallets_uuid'), 'wallets', ['uuid'], unique=True)
+
+
+def downgrade() -> None:
+    op.drop_index(op.f('ix_wallets_uuid'), table_name='wallets')
+    op.drop_table('wallets')
+
+=== Файл: pytest.ini ===
+[pytest]
+asyncio_mode = auto
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+testpaths = tests
+markers =
+    asyncio: mark test as asyncio-compatible
+
+=== Файл: requirements.txt ===
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+asyncpg==0.29.0
+alembic==1.12.1
+pydantic==2.5.0
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+
+# testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+httpx==0.25.1
+
+=== Файл: tests\.pytest_cache\CACHEDIR.TAG ===
+Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by pytest.
+# For information about cache directory tags, see:
+#	https://bford.info/cachedir/spec.html
+
+=== Файл: tests\.pytest_cache\README.md ===
+# pytest cache directory #
+
+This directory contains data from the pytest's cache plugin,
+which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+
+**Do not** commit this to version control.
+
+See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+
+=== Файл: tests\.pytest_cache\__init__.py ===
+
+
+=== Файл: tests\.pytest_cache\v\__init__.py ===
+
+
+=== Файл: tests\.pytest_cache\v\cache\__init__.py ===
+
+
+=== Файл: tests\.pytest_cache\v\cache\nodeids ===
+[]
+
+=== Файл: tests\.pytest_cache\v\cache\stepwise ===
+[]
+
+=== Файл: tests\__init__.py ===
+
+
+=== Файл: tests\__pycache__\__init__.py ===
+
+
+=== Файл: tests\conftest.py ===
+import pytest
+import asyncio
+from typing import AsyncGenerator, Generator
+from httpx import AsyncClient, ASGITransport
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.pool import NullPool
+
+from app.main import app
+from app.core.database import Base, get_db
+
+# Test database URL - для запуска внутри контейнера
+TEST_DATABASE_URL = "postgresql+asyncpg://user:password@db:5432/test_wallet_db"
+
+
+@pytest.fixture(scope="session")
+def event_loop() -> Generator:
+    """Create an instance of the default event loop for each test case."""
+    policy = asyncio.get_event_loop_policy()
+    loop = policy.new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest.fixture(scope="session")
+async def test_engine():
+    """Create test engine"""
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool, echo=True)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+
+    yield engine
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+    await engine.dispose()
+
+
+@pytest.fixture
+async def db_session(test_engine) -> AsyncGenerator[AsyncSession, None]:
+    """Create test database session"""
+    async_session = async_sessionmaker(
+        test_engine, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async with async_session() as session:
+        yield session
+        await session.rollback()
+
+
+@pytest.fixture
+async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+    """
+    Create a test client with overridden database dependency
+    """
+
+    # Override the get_db dependency
+    async def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    # Create async client
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        yield ac
+
+    # Clear overrides
+    app.dependency_overrides.clear()
+
+=== Файл: tests\test_simple.py ===
+import pytest
+from httpx import AsyncClient, ASGITransport
+from app.main import app
+
+@pytest.fixture
+async def simple_client():
+    """Fixture for a simple test client without database dependency"""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        yield client
+
+@pytest.mark.asyncio
+async def test_simple(simple_client):
+    """Simple test to check client fixture"""
+    response = await simple_client.get("/")
+    assert response.status_code == 200
+    data = response.json()
+    assert "message" in data
+    print(f"Response: {data}")
+
+=== Файл: tests\test_wallets.py ===
+import pytest
+from decimal import Decimal
+from uuid import uuid4, UUID
+from httpx import AsyncClient
+import asyncio
+
+
+@pytest.mark.asyncio
+async def test_create_wallet(client: AsyncClient):
+    """Test wallet creation"""
+    response = await client.post("/api/v1/wallets")
+    assert response.status_code == 201
+
+    data = response.json()
+    assert "uuid" in data
+    assert data["balance"] == "0.00"
+
+    # Validate UUID format
+    assert UUID(data["uuid"])
+
+
+@pytest.mark.asyncio
+async def test_get_wallet_balance(client: AsyncClient):
+    """Test getting wallet balance"""
+    # Create wallet first
+    create_response = await client.post("/api/v1/wallets")
+    assert create_response.status_code == 201
+    wallet_uuid = create_response.json()["uuid"]
+
+    # Get wallet balance
+    response = await client.get(f"/api/v1/wallets/{wallet_uuid}")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["uuid"] == wallet_uuid
+    assert Decimal(data["balance"]) == Decimal("0.00")
+
+
+@pytest.mark.asyncio
+async def test_get_nonexistent_wallet(client: AsyncClient):
+    """Test getting nonexistent wallet"""
+    fake_uuid = str(uuid4())
+    response = await client.get(f"/api/v1/wallets/{fake_uuid}")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Wallet not found"
+
+
+@pytest.mark.asyncio
+async def test_deposit_operation(client: AsyncClient):
+    """Test deposit operation"""
+    # Create wallet
+    create_response = await client.post("/api/v1/wallets")
+    assert create_response.status_code == 201
+    wallet_uuid = create_response.json()["uuid"]
+
+    # Perform deposit
+    operation_data = {"operation_type": "DEPOSIT", "amount": "100.50"}
+
+    response = await client.post(
+        f"/api/v1/wallets/{wallet_uuid}/operation", json=operation_data
+    )
+
+    # Должно быть 200, но если 409 - пробуем еще раз
+    if response.status_code == 409:
+        # Подождем немного и пробуем снова
+        import asyncio
+
+        await asyncio.sleep(0.1)
+        response = await client.post(
+            f"/api/v1/wallets/{wallet_uuid}/operation", json=operation_data
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["uuid"] == wallet_uuid
+    assert Decimal(data["balance"]) == Decimal("100.50")
+    assert data["operation_type"] == "DEPOSIT"
+    assert Decimal(data["amount"]) == Decimal("100.50")
+
+
+@pytest.mark.asyncio
+async def test_withdraw_operation(client: AsyncClient):
+    """Test withdraw operation"""
+    # Create wallet
+    create_response = await client.post("/api/v1/wallets")
+    assert create_response.status_code == 201
+    wallet_uuid = create_response.json()["uuid"]
+
+    # First deposit some money
+    deposit_data = {"operation_type": "DEPOSIT", "amount": "200.00"}
+    deposit_response = await client.post(
+        f"/api/v1/wallets/{wallet_uuid}/operation", json=deposit_data
+    )
+
+    # Если 409 - пробуем еще раз
+    if deposit_response.status_code == 409:
+        import asyncio
+
+        await asyncio.sleep(0.1)
+        deposit_response = await client.post(
+            f"/api/v1/wallets/{wallet_uuid}/operation", json=deposit_data
+        )
+    assert deposit_response.status_code == 200
+
+    # Perform withdraw
+    withdraw_data = {"operation_type": "WITHDRAW", "amount": "150.50"}
+
+    response = await client.post(
+        f"/api/v1/wallets/{wallet_uuid}/operation", json=withdraw_data
+    )
+
+    # Если 409 - пробуем еще раз
+    if response.status_code == 409:
+        await asyncio.sleep(0.1)
+        response = await client.post(
+            f"/api/v1/wallets/{wallet_uuid}/operation", json=withdraw_data
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert Decimal(data["balance"]) == Decimal("49.50")  # 200.00 - 150.50 = 49.50
+
+
+@pytest.mark.asyncio
+async def test_insufficient_funds(client: AsyncClient):
+    """Test withdrawal with insufficient funds"""
+    # Create wallet
+    create_response = await client.post("/api/v1/wallets")
+    assert create_response.status_code == 201
+    wallet_uuid = create_response.json()["uuid"]
+
+    # Try to withdraw without deposit
+    withdraw_data = {"operation_type": "WITHDRAW", "amount": "50.00"}
+
+    response = await client.post(
+        f"/api/v1/wallets/{wallet_uuid}/operation", json=withdraw_data
+    )
+
+    # Должно быть 400 (недостаточно средств), но может быть 409 из-за конкурентности
+    if response.status_code == 409:
+        await asyncio.sleep(0.1)
+        response = await client.post(
+            f"/api/v1/wallets/{wallet_uuid}/operation", json=withdraw_data
+        )
+
+    assert response.status_code == 400
+    assert "Insufficient funds" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_operations(client: AsyncClient):
+    """Test concurrent operations on same wallet"""
+
+    # Create wallet
+    create_response = await client.post("/api/v1/wallets")
+    assert create_response.status_code == 201
+    wallet_uuid = create_response.json()["uuid"]
+
+    # Initial deposit
+    deposit_data = {"operation_type": "DEPOSIT", "amount": "1000.00"}
+    response = await client.post(
+        f"/api/v1/wallets/{wallet_uuid}/operation", json=deposit_data
+    )
+
+    # Если 409 - пробуем еще раз
+    if response.status_code == 409:
+        await asyncio.sleep(0.1)
+        response = await client.post(
+            f"/api/v1/wallets/{wallet_uuid}/operation", json=deposit_data
+        )
+    assert response.status_code == 200
+
+    # Perform multiple concurrent operations
+    async def perform_operation(amount: str, op_type: str):
+        data = {"operation_type": op_type, "amount": amount}
+        return await client.post(f"/api/v1/wallets/{wallet_uuid}/operation", json=data)
+
+    # Create 10 concurrent requests
+    tasks = []
+    for i in range(5):
+        tasks.append(perform_operation("100.00", "WITHDRAW"))
+        tasks.append(perform_operation("50.00", "DEPOSIT"))
+
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Check all responses - могут быть 200 или 409, но не ошибки
+    successful = 0
+    conflicts = 0
+
+    for response in responses:
+        if isinstance(response, Exception):
+            print(f"Exception: {response}")
+        else:
+            if response.status_code == 200:
+                successful += 1
+            elif response.status_code == 409:
+                conflicts += 1
+
+    print(f"Successful: {successful}, Conflicts: {conflicts}")
+
+    # Check final balance - должно сходиться независимо от конфликтов
+    final_response = await client.get(f"/api/v1/wallets/{wallet_uuid}")
+    assert final_response.status_code == 200
+    final_balance = Decimal(final_response.json()["balance"])
+
+    # Calculate expected balance: 1000 - 5*100 + 5*50 = 1000 - 500 + 250 = 750
+    # Из-за конфликтов некоторые операции могут не выполниться, но баланс должен быть корректен
+    expected_min = Decimal("250.00")  # Минимум если все withdraw прошли, а deposit нет
+    expected_max = Decimal(
+        "1250.00"
+    )  # Максимум если все deposit прошли, а withdraw нет
+
+    assert expected_min <= final_balance <= expected_max
+    print(f"Final balance: {final_balance}")
+
